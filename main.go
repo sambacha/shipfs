@@ -1,29 +1,29 @@
 package main
 
 import (
-	"bytes"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 
 	mh "github.com/multiformats/go-multihash"
 	mhopts "github.com/multiformats/go-multihash/opts"
+	_ "github.com/multiformats/go-multihash/register/all"
+	_ "github.com/multiformats/go-multihash/register/miniosha256"
 )
 
-var usage = `usage: %s [MULTIHASH] <[FILE] >[FILE]
-    cat untrustedFile | hashpipe <expected-checksum> | trustedContext
-hashpipe - boldly journey into the unknown.
-It reads from stdin, checks the hash of the content, and outputs it IF AND
-ONLY IF it matches the provided hash checksum. This makes executing things
-a bit safer, as it requires compromising more communication channels. On
-error, hashpipe returns a non-zero error code, failing pipelines.
-OPTIONS
+var usage = `usage: %s [options] [FILE]
+Print or check multihash checksums.
+With no FILE, or when FILE is -, read standard input.
+Options:
 `
 
 // flags
 var opts *mhopts.Options
+var checkRaw string
+var checkMh mh.Multihash
 var quiet bool
+var help bool
 
 func init() {
 	flag.Usage = func() {
@@ -32,6 +32,14 @@ func init() {
 	}
 
 	opts = mhopts.SetupFlags(flag.CommandLine)
+
+	checkStr := "check checksum matches"
+	flag.StringVar(&checkRaw, "check", "", checkStr)
+	flag.StringVar(&checkRaw, "c", "", checkStr+" (shorthand)")
+
+	helpStr := "display help message"
+	flag.BoolVar(&help, "help", false, helpStr)
+	flag.BoolVar(&help, "h", false, helpStr+" (shorthand)")
 
 	quietStr := "quiet output (no newline on checksum, no error text)"
 	flag.BoolVar(&quiet, "quiet", false, quietStr)
@@ -43,63 +51,89 @@ func parseFlags(o *mhopts.Options) error {
 	if err := o.ParseError(); err != nil {
 		return err
 	}
+
+	if checkRaw != "" {
+		var err error
+		checkMh, err = mhopts.Decode(o.Encoding, checkRaw)
+		if err != nil {
+			return fmt.Errorf("fail to decode check '%s': %s", checkRaw, err)
+		}
+	}
+
 	return nil
 }
 
-func getInput(o *mhopts.Options) (mh.Multihash, error) {
+func getInput() (io.ReadCloser, error) {
 	args := flag.Args()
-	if len(args) < 1 {
-		return nil, fmt.Errorf("multihash is a required argument")
-	}
-	raw := args[0]
 
-	h, err := mhopts.Decode(o.Encoding, raw)
-	if err != nil {
-		return nil, fmt.Errorf("fail to decode multihash '%s': %s", raw, err)
+	switch {
+	case len(args) < 1:
+		return os.Stdin, nil
+	case args[0] == "-":
+		return os.Stdin, nil
+	default:
+		f, err := os.Open(args[0])
+		if err != nil {
+			return nil, fmt.Errorf("failed to open '%s': %s", args[0], err)
+		}
+		return f, nil
 	}
-	return h, nil
 }
-
-func run() error {
-	if err := parseFlags(opts); err != nil {
-		return err
-	}
-
-	// parse the given checksum
-	expect, err := getInput(opts)
+func printHash(o *mhopts.Options, r io.Reader) error {
+	h, err := o.Multihash(r)
 	if err != nil {
 		return err
 	}
 
-	// have to read all of it before we output any of it :/
-	input, err := ioutil.ReadAll(os.Stdin)
+	s, err := mhopts.Encode(o.Encoding, h)
 	if err != nil {
 		return err
 	}
 
-	// calculate the checksum of the input
-	actual, err := mh.Sum(input, opts.AlgorithmCode, opts.Length)
-	if err != nil {
-		return err
+	if quiet {
+		fmt.Print(s)
+	} else {
+		fmt.Println(s)
 	}
-
-	// ensure checksums match
-	if !bytes.Equal(expect, actual) {
-		return mhopts.ErrMatch
-	}
-
-	// ok, checksums matched, write it out
-	if !quiet {
-		_, err = os.Stdout.Write(input)
-	}
-	return err
+	return nil
 }
 
 func main() {
-	if err := run(); err != nil {
-		if !quiet {
-			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+	checkErr := func(err error) {
+		if err != nil {
+			die("error: ", err)
 		}
-		os.Exit(1)
 	}
+
+	err := parseFlags(opts)
+	checkErr(err)
+
+	if help {
+		flag.Usage()
+		os.Exit(0)
+	}
+
+	inp, err := getInput()
+	checkErr(err)
+
+	if checkMh != nil {
+		err = opts.Check(inp, checkMh)
+		checkErr(err)
+		if !quiet {
+			fmt.Println("OK checksums match (-q for no output)")
+		}
+	} else {
+		err = printHash(opts, inp)
+		checkErr(err)
+	}
+	inp.Close()
+}
+
+func die(v ...interface{}) {
+	if !quiet {
+		fmt.Fprint(os.Stderr, v...)
+		fmt.Fprint(os.Stderr, "\n")
+	}
+	// flag.Usage()
+	os.Exit(1)
 }
